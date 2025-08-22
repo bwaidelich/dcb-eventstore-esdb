@@ -10,6 +10,9 @@ Install via [composer](https://getcomposer.org):
 composer require wwwision/dcb-eventstore-esdb
 ```
 
+> [!NOTE]  
+> This is work in progress, usage details will follow
+
 ## Contribution
 
 Contributions in the form of [issues](https://github.com/bwaidelich/dcb-eventstore-esdb/issues) or [pull requests](https://github.com/bwaidelich/dcb-eventstore-esdb/pulls) are highly appreciated
