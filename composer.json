@@ -1,0 +1,75 @@
+{
+  "name": "wwwision/dcb-eventstore-esdb",
+  "description": "EventSourcing Database adapter for the Dynamic Consistency Boundary implementation",
+  "type": "package",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Bastian Waidelich",
+      "email": "b.waidelich@wwwision.de"
+    }
+  ],
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/bwaidelich"
+    },
+    {
+      "type": "paypal",
+      "url": "https://www.paypal.me/bwaidelich"
+    }
+  ],
+  "require": {
+    "php": ">=8.4",
+    "webmozart/assert": "^1.11",
+    "guzzlehttp/guzzle": "^7",
+    "wwwision/dcb-eventstore": "@dev",
+    "thenativeweb/eventsourcingdb": "^1.0",
+    "psr/clock": "^1.0"
+  },
+  "require-dev": {
+    "roave/security-advisories": "dev-latest",
+    "phpstan/phpstan": "^2",
+    "squizlabs/php_codesniffer": "^4.0.x-dev",
+    "phpunit/phpunit": "^12",
+    "brianium/paratest": "^7",
+    "testcontainers/testcontainers": "1.0.3"
+  },
+  "autoload": {
+    "psr-4": {
+      "Wwwision\\DCBEventStoreESDB\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Wwwision\\DCBEventStoreESDB\\Tests\\": "tests/",
+      "Wwwision\\DCBEventStore\\Tests\\": "vendor/wwwision/dcb-eventstore/tests/"
+    }
+  },
+  "scripts": {
+    "test:phpstan": "phpstan",
+    "test:cs": "phpcs --colors src",
+    "test:cs:fix": "phpcbf --colors src",
+    "test:integration": [
+      "echo $DCB_TEST_DSN",
+      "phpunit tests/Integration --exclude-group=parallel --exclude-group=feature_liveStream --exclude-group=feature_onlyLastEventCombined"
+    ],
+    "test:consistency": [
+      "Wwwision\\DCBEventStoreESDB\\Tests\\Integration\\ConcurrencyTest::prepare",
+      "paratest tests/Integration --group=parallel --functional --processes 20",
+      "Wwwision\\DCBEventStoreESDB\\Tests\\Integration\\ConcurrencyTest::validateEvents",
+      "Wwwision\\DCBEventStoreESDB\\Tests\\Integration\\ConcurrencyTest::cleanup"
+    ],
+    "test": [
+      "@test:phpstan",
+      "@test:cs",
+      "@test:integration",
+      "@test:consistency"
+    ]
+  },
+  "config": {
+    "allow-plugins": {
+      "php-http/discovery": true
+    }
+  }
+}
