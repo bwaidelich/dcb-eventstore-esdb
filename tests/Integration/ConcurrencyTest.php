@@ -5,9 +5,10 @@ namespace Wwwision\DCBEventStoreESDB\Tests\Integration;
 
 use PHPUnit\Framework\Attributes\CoversNothing;
 use RuntimeException;
+use Thenativeweb\Eventsourcingdb\Container;
 use Wwwision\DCBEventStore\EventStore;
+use Wwwision\DCBEventStore\Query\Query;
 use Wwwision\DCBEventStore\Tests\Integration\EventStoreConcurrencyTestBase;
-use Wwwision\DCBEventStore\Types\StreamQuery\StreamQuery;
 use Wwwision\DCBEventStoreESDB\ESDBEventStore;
 
 require_once __DIR__ . '/../../vendor/autoload.php';
@@ -17,32 +18,35 @@ final class ConcurrencyTest extends EventStoreConcurrencyTestBase
 {
 
     private static ESDBEventStore|null $eventStore = null;
+    private static Container|null $testContainer = null;
 
     public static function prepare(): void
     {
         $eventStore = self::createEventStore();
-        if ($eventStore->read(StreamQuery::wildcard())->first() !== null) {
+        if ($eventStore->read(Query::all())->first() !== null) {
             throw new RuntimeException('The event store must not contain any events before preforming consistency tests');
         }
     }
 
     public static function cleanup(): void
     {
-        // nothing to do here
+        self::$testContainer?->stop();
+        self::$testContainer = null;
+        putenv('DCB_TEST_ESDB_URL');
+        putenv('DCB_TEST_ESDB_API_KEY');
     }
 
     protected static function createEventStore(): EventStore
     {
         if (self::$eventStore === null) {
-            $baseUri = getenv('DCB_TEST_BASE_URI');
-            if (empty($baseUri) || !is_string($baseUri)) {
-                throw new RuntimeException('Missing/invalid environment variable DCB_TEST_BASE_URI');
+            $esdbUrl = getenv('DCB_TEST_ESDB_URL');
+            if (!is_string($esdbUrl)) {
+                self::$testContainer = (new Container())->withImageTag('preview');
+                self::$testContainer->start();
+                $esdbUrl = self::$testContainer->getBaseUrl();
+                putenv('DCB_TEST_ESDB_URL=' . $esdbUrl);
             }
-            $apiKey = getenv('DCB_TEST_API_KEY');
-            if (empty($apiKey) || !is_string($apiKey)) {
-                throw new RuntimeException('Missing/invalid environment variable DCB_TEST_API_KEY');
-            }
-            self::$eventStore = ESDBEventStore::create($baseUri, $apiKey);
+            self::$eventStore = ESDBEventStore::create($esdbUrl, getenv('DCB_TEST_ESDB_API_KEY') ?: 'secret');
         }
         return self::$eventStore;
     }

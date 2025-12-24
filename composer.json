@@ -23,7 +23,7 @@
     "php": ">=8.4",
     "webmozart/assert": "^1.11",
     "guzzlehttp/guzzle": "^7",
-    "wwwision/dcb-eventstore": "@dev",
+    "wwwision/dcb-eventstore": "^5",
     "thenativeweb/eventsourcingdb": "^1.0",
     "psr/clock": "^1.0"
   },

@@ -8,14 +8,18 @@ use DateTimeImmutable;
 use Psr\Clock\ClockInterface;
 use RuntimeException;
 use Thenativeweb\Eventsourcingdb\Client;
+use Webmozart\Assert\Assert;
+use Wwwision\DCBEventStore\AppendCondition\AppendCondition;
+use Wwwision\DCBEventStore\Event\Event;
+use Wwwision\DCBEventStore\Event\Events;
 use Wwwision\DCBEventStore\EventStore;
 use Wwwision\DCBEventStore\Exceptions\ConditionalAppendFailed;
-use Wwwision\DCBEventStore\Types\AppendCondition;
-use Wwwision\DCBEventStore\Types\Event;
-use Wwwision\DCBEventStore\Types\Events;
-use Wwwision\DCBEventStore\Types\ReadOptions;
-use Wwwision\DCBEventStore\Types\StreamQuery\Criteria\EventTypesAndTagsCriterion;
-use Wwwision\DCBEventStore\Types\StreamQuery\StreamQuery;
+use Wwwision\DCBEventStore\Query\Query;
+use Wwwision\DCBEventStore\Query\QueryItem;
+use Wwwision\DCBEventStore\ReadOptions;
+use Wwwision\DCBEventStore\SequencedEvent\SequencedEvent;
+use Wwwision\DCBEventStore\SequencedEvent\SequencedEvents;
+use Wwwision\DCBEventStore\SequencedEvent\SequencePosition;
 
 final readonly class ESDBEventStore implements EventStore
 {
@@ -63,7 +67,7 @@ final readonly class ESDBEventStore implements EventStore
         $this->client->ping();
     }
 
-    public function read(StreamQuery $query, ?ReadOptions $options = null): ESDBEventStream
+    public function read(Query $query, ReadOptions|null $options = null): SequencedEvents
     {
         $eventQLParts = ['FROM e IN events'];
         $eventQLConditions = $this->convertQueryToEventQLConditions($query, $onlyLastEvent);
@@ -79,21 +83,29 @@ final readonly class ESDBEventStore implements EventStore
         }
         if ($onlyLastEvent) {
             $eventQLParts[] = 'TOP 1';
+        } elseif ($options?->limit !== null) {
+            $eventQLParts[] = 'TOP ' . $options->limit;
         }
-        $eventQLParts[] = 'PROJECT INTO { type: SUBSTRING(e.type, ' . strlen($this->eventTypePrefix) . '), tags: e.data.tags, data: e.data.payload, recorded_at: e.data.recorded_at, position: (e.id AS INT + 1) }';
+        $eventQLParts[] = 'PROJECT INTO { type: SUBSTRING(e.type, ' . strlen($this->eventTypePrefix) . '), tags: e.data.tags, data: e.data.payload, metadata: e.data.metadata, recorded_at: e.data.recorded_at, position: (e.id AS INT + 1) }';
 
-        return new ESDBEventStream($this->client->runEventQlQuery(implode(' ', $eventQLParts)));
+        $result = $this->client->runEventQlQuery(implode(' ', $eventQLParts));
+        return SequencedEvents::create(static function () use ($result) {
+            foreach ($result as $event) {
+                yield self::convertESDBEvent($event);
+            }
+        });
     }
 
-    public function append(Events|Event $events, AppendCondition $condition): void
+    public function append(Events|Event $events, AppendCondition|null $condition = null): void
     {
         $convertedEvents = $events instanceof Events ? $events->map($this->convertEvent(...)) : [$this->convertEvent($events)];
+        $preconditions = $condition !== null ? self::convertAppendCondition($condition) : [];
         try {
-            $this->client->writeEvents($convertedEvents, $this->convertAppendCondition($condition));
+            $this->client->writeEvents($convertedEvents, $preconditions);
         } catch (RuntimeException $exception) {
             // FIXME this hack is required because {@see Client::writeEvents} does not allow to detect this case otherwise
-            if ($exception->getMessage() === 'Failed to write events, got HTTP status code \'409\', expected \'200\'') {
-                $exception = $condition->expectedHighestSequenceNumber->isNone() ? ConditionalAppendFailed::becauseNoEventWhereExpected() : ConditionalAppendFailed::becauseHighestExpectedSequenceNumberDoesNotMatch($condition->expectedHighestSequenceNumber);
+            if ($condition !== null && $exception->getMessage() === 'Failed to write events, got HTTP status code \'409\', expected \'200\'') {
+                $exception = $condition->after === null ? ConditionalAppendFailed::becauseMatchingEventsExist() : ConditionalAppendFailed::becauseMatchingEventsExistAfterSequencePosition($condition->after);
             }
             throw $exception;
         }
@@ -112,6 +124,7 @@ final readonly class ESDBEventStore implements EventStore
                 'payload' => $event->data->value,
                 'tags' => $event->tags->toStrings(),
                 'recorded_at' => $this->clock->now()->format('Y-m-d H:i:s'),
+                'metadata' => $event->metadata->value,
             ],
         ];
     }
@@ -119,15 +132,12 @@ final readonly class ESDBEventStore implements EventStore
     /**
      * @return array<int, mixed>
      */
-    private function convertAppendCondition(AppendCondition $condition): array
+    private static function convertAppendCondition(AppendCondition $condition): array
     {
-        if ($condition->expectedHighestSequenceNumber->isAny()) {
-            return [];
-        }
         $eventQLParts = ['FROM e IN events'];
-        $eventQLConditions = $this->convertQueryToEventQLConditions($condition->query);
-        if (!$condition->expectedHighestSequenceNumber->isNone()) {
-            $eventQLConditions[] = '(e.id AS INT + 1) > ' . $condition->expectedHighestSequenceNumber->extractSequenceNumber()->value;
+        $eventQLConditions = self::convertQueryToEventQLConditions($condition->failIfEventsMatch);
+        if ($condition->after !== null) {
+            $eventQLConditions[] = '(e.id AS INT + 1) > ' . $condition->after->value;
         }
         if ($eventQLConditions !== []) {
             $eventQLParts[] = 'WHERE (' . implode(') AND (', $eventQLConditions) . ')';
@@ -146,23 +156,23 @@ final readonly class ESDBEventStore implements EventStore
     /**
      * @return array<int, string>
      */
-    private function convertQueryToEventQLConditions(StreamQuery $query, bool|null &$onlyLastEvent = null): array
+    private static function convertQueryToEventQLConditions(Query $query, bool|null &$onlyLastEvent = null): array
     {
-        if ($query->isWildcard()) {
+        if (!$query->hasItems()) {
             return [];
         }
         $numberOfCriteria = 0;
-        $eventQLParts = $query->criteria->map(function (EventTypesAndTagsCriterion $c) use (&$onlyLastEvent, &$numberOfCriteria) {
+        $eventQLParts = $query->map(function (QueryItem $item) use (&$onlyLastEvent, &$numberOfCriteria) {
             $numberOfCriteria ++;
-            if ($c->onlyLastEvent) {
+            if ($item->onlyLastEvent) {
                 $onlyLastEvent = true;
             }
             $subParts = [];
-            if ($c->eventTypes !== null) {
-                $subParts[] = '["' . implode('","', array_map(static fn(string $type) => "events.dcb.$type", $c->eventTypes->toStringArray())) . '"] CONTAINS e.type';
+            if ($item->eventTypes !== null) {
+                $subParts[] = '["' . implode('","', array_map(static fn(string $type) => "events.dcb.$type", $item->eventTypes->toStringArray())) . '"] CONTAINS e.type';
             }
-            if ($c->tags !== null) {
-                $subParts[] = implode(' AND ', array_map(static fn(string $tag) => "e.data.tags CONTAINS \"$tag\"", $c->tags->toStrings()));
+            if ($item->tags !== null) {
+                $subParts[] = implode(' AND ', array_map(static fn(string $tag) => "e.data.tags CONTAINS \"$tag\"", $item->tags->toStrings()));
             }
             return implode(' AND ', $subParts);
         });
@@ -170,5 +180,25 @@ final readonly class ESDBEventStore implements EventStore
             throw new RuntimeException('This adapter supports the "onlyLastEvent" flag only for queries that contain a single criterion');
         }
         return [implode(') OR (', $eventQLParts)];
+    }
+
+    /**
+     * @param array<mixed> $event
+     */
+    private static function convertESDBEvent(array $event): SequencedEvent
+    {
+        Assert::numeric($event['position']);
+        $recordedAt = DateTimeImmutable::createFromFormat('Y-m-d H:i:s', $event['recorded_at']);
+        Assert::isInstanceOf($recordedAt, DateTimeImmutable::class);
+        return new SequencedEvent(
+            SequencePosition::fromInteger((int)$event['position']),
+            $recordedAt,
+            Event::create(
+                $event['type'],
+                $event['data'],
+                $event['tags'],
+                $event['metadata'],
+            ),
+        );
     }
 }
